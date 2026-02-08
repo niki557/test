@@ -7,6 +7,8 @@ import re
 import threading
 import queue
 import time
+import os
+from datetime import datetime
 
 class TextDuplicateChecker:
     def __init__(self, root):
@@ -19,6 +21,7 @@ class TextDuplicateChecker:
         self.is_processing = False  # 처리 중 플래그
         self._result_queue = queue.Queue()
         self._flush_id = None
+        self.save_dir = os.path.dirname(os.path.abspath(__file__))
 
         self.create_widgets()
     
@@ -53,6 +56,30 @@ class TextDuplicateChecker:
         ttk.Spinbox(lev_frame, from_=5, to=100, textvariable=self.min_length, 
                    width=5).pack(side="left", padx=5)
         
+        # 출력 설정 프레임
+        output_frame = ttk.LabelFrame(self.root, text="출력 설정", padding=10)
+        output_frame.pack(fill="x", padx=10, pady=5)
+
+        limit_frame = ttk.Frame(output_frame)
+        limit_frame.pack(fill="x", pady=2)
+
+        ttk.Label(limit_frame, text="GUI 표시 제한:").pack(side="left", padx=5)
+        self.display_limit_var = tk.IntVar(value=500)
+        ttk.Spinbox(limit_frame, from_=10, to=99999,
+                    textvariable=self.display_limit_var,
+                    width=8).pack(side="left", padx=5)
+        ttk.Label(limit_frame, text="개 (초과 결과는 TXT로 자동 저장)").pack(side="left", padx=5)
+
+        save_frame = ttk.Frame(output_frame)
+        save_frame.pack(fill="x", pady=2)
+
+        ttk.Label(save_frame, text="저장 폴더:").pack(side="left", padx=5)
+        self.save_dir_var = tk.StringVar(value=self.save_dir)
+        ttk.Entry(save_frame, textvariable=self.save_dir_var).pack(
+            side="left", fill="x", expand=True, padx=5)
+        ttk.Button(save_frame, text="폴더 선택",
+                   command=self.select_save_folder).pack(side="left", padx=5)
+
         # 중간 프레임 - 파일 관리
         middle_frame = ttk.LabelFrame(self.root, text="파일 관리", padding=10)
         middle_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -159,6 +186,29 @@ class TextDuplicateChecker:
         text = re.sub(r'\s+', ' ', text)
         return text.strip()
     
+    def select_save_folder(self):
+        """저장 폴더 선택"""
+        folder = filedialog.askdirectory(
+            title="결과 저장 폴더 선택",
+            initialdir=self.save_dir_var.get()
+        )
+        if folder:
+            self.save_dir_var.set(folder)
+
+    def save_results_to_file(self, method_name, results_text):
+        """전체 결과를 TXT 파일로 저장"""
+        save_dir = self.save_dir_var.get()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"중복검사_{method_name}_{timestamp}.txt"
+        filepath = os.path.join(save_dir, filename)
+
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(results_text)
+            self.append_result(f"\n전체 결과 저장 완료: {filepath}\n", "header")
+        except Exception as e:
+            self.append_result(f"\n파일 저장 실패: {e}\n", "warning")
+
     def cancel_check(self):
         """검사 중지"""
         self.is_processing = False
@@ -347,19 +397,30 @@ class TextDuplicateChecker:
         # 중복 결과 출력
         self.update_progress(0, 1, "결과 생성 중...")
         duplicate_count = 0
-        display_limit = 500
+        display_limit = self.display_limit_var.get()
+        all_results = []
+
         for ngram, occurrences in ngram_map.items():
             if not self.is_processing:
                 return
 
             if len(occurrences) > 1:
                 duplicate_count += 1
+
+                # 전체 결과 수집
+                result = f"[중복 패턴 #{duplicate_count}] 총 {len(occurrences)}회 발견\n"
+                result += f"패턴: {ngram}\n위치:\n"
+                for occ in occurrences:
+                    result += f"  - {occ['file']} (단어 위치 {occ['position']})\n"
+                result += "\n"
+                all_results.append(result)
+
+                # GUI에는 제한 개수만 표시
                 if duplicate_count <= display_limit:
                     self.append_result(f"[중복 패턴 #{duplicate_count}] ", "highlight")
                     self.append_result(f"총 {len(occurrences)}회 발견\n")
                     self.append_result(f"패턴: {ngram}\n")
                     self.append_result("위치:\n")
-
                     for occ in occurrences:
                         self.append_result(f"  - {occ['file']} (단어 위치 {occ['position']})\n")
                     self.append_result("\n")
@@ -373,6 +434,8 @@ class TextDuplicateChecker:
             if duplicate_count > display_limit:
                 self.append_result(
                     f"\n⚠️ {duplicate_count}개 발견, 상위 {display_limit}개만 표시합니다.\n\n", "warning")
+                header = f"=== N-gram 분석 전체 결과 ===\n총 {duplicate_count}개의 중복 패턴\n\n"
+                self.save_results_to_file("ngram", header + "".join(all_results))
             self.append_result(f"\n총 {duplicate_count}개의 중복 패턴을 발견했습니다.\n", "header")
     
     def levenshtein_distance(self, s1, s2):
@@ -466,32 +529,49 @@ class TextDuplicateChecker:
         
         # 결과 출력
         self.update_progress(0, 1, "결과 생성 중...")
-        
+
         if not found_pairs:
             self.append_result(f"유사한 문장이 없습니다. (임계값: {threshold})\n")
         else:
             found_pairs.sort(key=lambda x: x['distance'])
-            
-            # 최대 100개만 표시
-            display_count = min(len(found_pairs), 100)
-            if len(found_pairs) > 100:
+            display_limit = self.display_limit_var.get()
+            display_count = min(len(found_pairs), display_limit)
+
+            if len(found_pairs) > display_limit:
                 self.append_result(
-                    f"⚠️ {len(found_pairs)}개 발견, 상위 100개만 표시합니다.\n\n", 
+                    f"⚠️ {len(found_pairs)}개 발견, 상위 {display_limit}개만 표시합니다.\n\n",
                     "warning")
-            
-            for idx, pair in enumerate(found_pairs[:display_count], 1):
+
+            all_results = []
+            for idx, pair in enumerate(found_pairs, 1):
                 if not self.is_processing:
                     return
-                
-                self.append_result(f"[유사 #{idx}] ", "highlight")
-                self.append_result(f"편집 거리: {pair['distance']}\n")
-                self.append_result(f"문장1: {pair['line1']['content']}\n")
-                self.append_result(
-                    f"  위치: {pair['line1']['file']} (줄 {pair['line1']['line_num']})\n")
-                self.append_result(f"문장2: {pair['line2']['content']}\n")
-                self.append_result(
-                    f"  위치: {pair['line2']['file']} (줄 {pair['line2']['line_num']})\n\n")
-            
+
+                result = f"[유사 #{idx}] 편집 거리: {pair['distance']}\n"
+                result += f"문장1: {pair['line1']['content']}\n"
+                result += f"  위치: {pair['line1']['file']} (줄 {pair['line1']['line_num']})\n"
+                result += f"문장2: {pair['line2']['content']}\n"
+                result += f"  위치: {pair['line2']['file']} (줄 {pair['line2']['line_num']})\n\n"
+                all_results.append(result)
+
+                if idx <= display_count:
+                    self.append_result(f"[유사 #{idx}] ", "highlight")
+                    self.append_result(f"편집 거리: {pair['distance']}\n")
+                    self.append_result(f"문장1: {pair['line1']['content']}\n")
+                    self.append_result(
+                        f"  위치: {pair['line1']['file']} (줄 {pair['line1']['line_num']})\n")
+                    self.append_result(f"문장2: {pair['line2']['content']}\n")
+                    self.append_result(
+                        f"  위치: {pair['line2']['file']} (줄 {pair['line2']['line_num']})\n\n")
+
+                if idx % 100 == 0:
+                    time.sleep(0.01)
+
+            if len(found_pairs) > display_limit:
+                header = f"=== 레벤슈타인 분석 전체 결과 ===\n"
+                header += f"임계값: {threshold}, 총 {len(found_pairs)}개의 유사 문장 쌍\n\n"
+                self.save_results_to_file("levenshtein", header + "".join(all_results))
+
             self.append_result(
                 f"\n총 {len(found_pairs)}개의 유사 문장 쌍을 발견했습니다.\n", "header")
     
@@ -561,18 +641,28 @@ class TextDuplicateChecker:
         
         # 결과 출력
         duplicate_count = 0
-        display_limit = 500
+        display_limit = self.display_limit_var.get()
+        all_results = []
+
         for fp, occurrences in fingerprint_map.items():
             if not self.is_processing:
                 return
 
             if len(occurrences) > 1:
                 duplicate_count += 1
+
+                # 전체 결과 수집
+                result = f"[중복 지문 #{duplicate_count}] 총 {len(occurrences)}회 발견\n위치:\n"
+                for occ in occurrences:
+                    result += f"  - {occ['file']} (위치 {occ['position']})\n"
+                result += "\n"
+                all_results.append(result)
+
+                # GUI에는 제한 개수만 표시
                 if duplicate_count <= display_limit:
                     self.append_result(f"[중복 지문 #{duplicate_count}] ", "highlight")
                     self.append_result(f"총 {len(occurrences)}회 발견\n")
                     self.append_result("위치:\n")
-
                     for occ in occurrences:
                         self.append_result(f"  - {occ['file']} (위치 {occ['position']})\n")
                     self.append_result("\n")
@@ -586,6 +676,8 @@ class TextDuplicateChecker:
             if duplicate_count > display_limit:
                 self.append_result(
                     f"\n⚠️ {duplicate_count}개 발견, 상위 {display_limit}개만 표시합니다.\n\n", "warning")
+                header = f"=== Winnowing 분석 전체 결과 ===\n총 {duplicate_count}개의 중복 지문\n\n"
+                self.save_results_to_file("winnowing", header + "".join(all_results))
             self.append_result(
                 f"\n총 {duplicate_count}개의 중복 지문을 발견했습니다.\n", "header")
 
