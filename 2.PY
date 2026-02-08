@@ -5,6 +5,8 @@ from collections import defaultdict
 from difflib import SequenceMatcher
 import re
 import threading
+import queue
+import time
 
 class TextDuplicateChecker:
     def __init__(self, root):
@@ -15,7 +17,9 @@ class TextDuplicateChecker:
         self.files = []  # 파일 경로 저장
         self.file_contents = {}  # 파일별 원본 내용 저장
         self.is_processing = False  # 처리 중 플래그
-        
+        self._result_queue = queue.Queue()
+        self._flush_id = None
+
         self.create_widgets()
     
     def create_widgets(self):
@@ -183,6 +187,7 @@ class TextDuplicateChecker:
         
         thread = threading.Thread(target=self.run_check, args=(method,), daemon=True)
         thread.start()
+        self._start_result_flusher()
     
     def run_check(self, method):
         """백그라운드에서 검사 실행"""
@@ -203,6 +208,7 @@ class TextDuplicateChecker:
     def finish_check(self):
         """검사 완료 후 처리"""
         self.is_processing = False
+        self._flush_remaining()
         self.check_button.config(state="normal")
         self.cancel_button.config(state="disabled")
         self.progress['value'] = 100
@@ -218,14 +224,46 @@ class TextDuplicateChecker:
             self.root.after(0, lambda: self.progress_label.config(text=message))
     
     def append_result(self, text, tag=None):
-        """결과 텍스트 추가 (쓰레드 안전)"""
-        def insert():
-            if tag:
-                self.result_text.insert(tk.END, text, tag)
+        """결과 텍스트 추가 (큐 기반 배치 처리)"""
+        self._result_queue.put((text, tag))
+
+    def _start_result_flusher(self):
+        """주기적으로 큐의 결과를 GUI에 반영 (100ms 간격 배치)"""
+        def flush():
+            count = 0
+            while count < 200:
+                try:
+                    text, tag = self._result_queue.get_nowait()
+                    if tag:
+                        self.result_text.insert(tk.END, text, tag)
+                    else:
+                        self.result_text.insert(tk.END, text)
+                    count += 1
+                except queue.Empty:
+                    break
+            if count > 0:
+                self.result_text.see(tk.END)
+            if self.is_processing or not self._result_queue.empty():
+                self._flush_id = self.root.after(100, flush)
             else:
-                self.result_text.insert(tk.END, text)
-            self.result_text.see(tk.END)
-        self.root.after(0, insert)
+                self._flush_id = None
+        flush()
+
+    def _flush_remaining(self):
+        """남은 결과를 모두 출력"""
+        if self._flush_id is not None:
+            self.root.after_cancel(self._flush_id)
+            self._flush_id = None
+        while not self._result_queue.empty():
+            try:
+                text, tag = self._result_queue.get_nowait()
+                if tag:
+                    self.result_text.insert(tk.END, text, tag)
+                else:
+                    self.result_text.insert(tk.END, text)
+            except queue.Empty:
+                break
+        self.result_text.see(tk.END)
     
     def check_with_hashing(self):
         """해싱 기법으로 중복 검사"""
@@ -309,24 +347,32 @@ class TextDuplicateChecker:
         # 중복 결과 출력
         self.update_progress(0, 1, "결과 생성 중...")
         duplicate_count = 0
+        display_limit = 500
         for ngram, occurrences in ngram_map.items():
             if not self.is_processing:
                 return
-            
+
             if len(occurrences) > 1:
                 duplicate_count += 1
-                self.append_result(f"[중복 패턴 #{duplicate_count}] ", "highlight")
-                self.append_result(f"총 {len(occurrences)}회 발견\n")
-                self.append_result(f"패턴: {ngram}\n")
-                self.append_result("위치:\n")
-                
-                for occ in occurrences:
-                    self.append_result(f"  - {occ['file']} (단어 위치 {occ['position']})\n")
-                self.append_result("\n")
-        
+                if duplicate_count <= display_limit:
+                    self.append_result(f"[중복 패턴 #{duplicate_count}] ", "highlight")
+                    self.append_result(f"총 {len(occurrences)}회 발견\n")
+                    self.append_result(f"패턴: {ngram}\n")
+                    self.append_result("위치:\n")
+
+                    for occ in occurrences:
+                        self.append_result(f"  - {occ['file']} (단어 위치 {occ['position']})\n")
+                    self.append_result("\n")
+
+                if duplicate_count % 100 == 0:
+                    time.sleep(0.01)
+
         if duplicate_count == 0:
             self.append_result("중복된 패턴이 없습니다.\n")
         else:
+            if duplicate_count > display_limit:
+                self.append_result(
+                    f"\n⚠️ {duplicate_count}개 발견, 상위 {display_limit}개만 표시합니다.\n\n", "warning")
             self.append_result(f"\n총 {duplicate_count}개의 중복 패턴을 발견했습니다.\n", "header")
     
     def levenshtein_distance(self, s1, s2):
@@ -392,11 +438,12 @@ class TextDuplicateChecker:
             if not self.is_processing:
                 return
             
-            # 진행률 업데이트 (100번마다)
+            # 진행률 업데이트
             if i % 10 == 0:
                 progress = (i / total_lines) * 100
-                self.update_progress(i, total_lines, 
+                self.update_progress(i, total_lines,
                     f"비교 중... {i}/{total_lines} 줄 ({len(found_pairs)}개 발견)")
+                time.sleep(0.01)
             
             for j in range(i + 1, len(all_lines)):
                 comparison_count += 1
@@ -514,23 +561,31 @@ class TextDuplicateChecker:
         
         # 결과 출력
         duplicate_count = 0
+        display_limit = 500
         for fp, occurrences in fingerprint_map.items():
             if not self.is_processing:
                 return
-            
+
             if len(occurrences) > 1:
                 duplicate_count += 1
-                self.append_result(f"[중복 지문 #{duplicate_count}] ", "highlight")
-                self.append_result(f"총 {len(occurrences)}회 발견\n")
-                self.append_result("위치:\n")
-                
-                for occ in occurrences:
-                    self.append_result(f"  - {occ['file']} (위치 {occ['position']})\n")
-                self.append_result("\n")
-        
+                if duplicate_count <= display_limit:
+                    self.append_result(f"[중복 지문 #{duplicate_count}] ", "highlight")
+                    self.append_result(f"총 {len(occurrences)}회 발견\n")
+                    self.append_result("위치:\n")
+
+                    for occ in occurrences:
+                        self.append_result(f"  - {occ['file']} (위치 {occ['position']})\n")
+                    self.append_result("\n")
+
+                if duplicate_count % 100 == 0:
+                    time.sleep(0.01)
+
         if duplicate_count == 0:
             self.append_result("중복된 지문이 없습니다.\n")
         else:
+            if duplicate_count > display_limit:
+                self.append_result(
+                    f"\n⚠️ {duplicate_count}개 발견, 상위 {display_limit}개만 표시합니다.\n\n", "warning")
             self.append_result(
                 f"\n총 {duplicate_count}개의 중복 지문을 발견했습니다.\n", "header")
 
